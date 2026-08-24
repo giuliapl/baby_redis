@@ -8,12 +8,38 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-
 #define PORT 6379
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
-#define PING_MSG "PING\n"
 
+typedef enum {
+    CMD_INVALID,
+    CMD_PING,
+    CMD_ECHO
+} Command;
+
+typedef struct {
+    Command type;
+    char *argument;
+} ParsedCommand;
+
+ParsedCommand parse_command(char *input);
+
+/* Parse argument from request and returns the parsed command. */
+ParsedCommand parse_command(char *input) {
+    ParsedCommand result = {CMD_INVALID, NULL};
+    if (input == NULL) return result;
+    char *space = strchr(input, ' ');
+
+    if (strncmp(input, "PING", 4) == 0) {
+        result.type = CMD_PING;
+    } else if (strncmp(input, "ECHO", 4) == 0 && input[4] == ' ') {
+        result.type = CMD_ECHO;
+        result.argument = space + 1;
+    }
+
+    return result;
+}
 
 int main(void)
 {
@@ -23,7 +49,6 @@ int main(void)
 
     // sockaddr_in represents an IPv4 socket address. 127.0.0.1:6379
     struct sockaddr_in address;
-
 
     // Create a socket
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -105,19 +130,28 @@ int main(void)
         
         
         // send
-        const char *response = "+PONG\r\n";
-        
-        // check if text is acceptable (PING only)
-        if (strcmp(buffer, PING_MSG) != 0) {
-            response = "-ERR unknown command\r\n";
-        }
+        const char *response = "";
+        ParsedCommand cmd = parse_command(buffer);
+        int bytes_sent = 0;
 
-        int bytes_sent = send(
-            client_fd,
-            response,
-            strlen(response),
-            0
-        );
+        switch (cmd.type) {
+            case CMD_PING:
+                response = "+PONG\r\n";
+                bytes_sent = send(client_fd, response, strlen(response), 0);
+                break;
+
+            case CMD_ECHO:
+                if (cmd.argument != NULL) {
+                    bytes_sent = send(client_fd, cmd.argument, strlen(cmd.argument), 0);
+                    bytes_sent = send(client_fd, "\r\n", 2, 0);
+                }
+                break;
+
+            default:
+                response = "-ERR unknown command\r\n";
+                bytes_sent = send(client_fd, response, strlen(response), 0);
+                break;
+        }
 
         if (bytes_sent == -1) {
             perror("send");
