@@ -1,5 +1,3 @@
-/* Raw PING: receive text from nc. If the client sends PING, reply +PONG\r\n. Otherwise reply -ERR unknown command\r\n. */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -24,6 +22,7 @@ typedef struct {
 } ParsedCommand;
 
 ParsedCommand parse_command(char *input);
+int parse_simple_string(const char *input, size_t len, char output[]);
 
 /* Parse argument from request and returns the parsed command. */
 ParsedCommand parse_command(char *input) {
@@ -41,8 +40,25 @@ ParsedCommand parse_command(char *input) {
     return result;
 }
 
-int main(void)
-{
+/* Parse a RESP simple string: +string\r\n. Returns 1 if valid, 0 otherwise. */
+int parse_simple_string(const char *input, size_t len, char output[]) {
+    if (len < 3) return 0; // +, \r, \n have not all been passed
+    if (*input != '+') return 0;
+    if (input[len - 2] != '\r') return 0;
+    if (input[len - 1] != '\n') return 0;
+    
+    int i = 0;
+    input++;
+
+    while (*input != '\r') {
+        output[i++] = *input++;
+    }
+
+    output[i] = '\0';
+    return 1;
+}
+
+int main(void) {
     // File descriptors
     int server_fd;
     int client_fd;
