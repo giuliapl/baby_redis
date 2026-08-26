@@ -22,7 +22,8 @@ typedef struct {
 } ParsedCommand;
 
 ParsedCommand parse_command(char *input);
-int parse_simple_string(const char *input, size_t len, char output[]);
+int parse_simple_string(const char *input, char output[]);
+int parse_bulk_string(const char *input, char output[]);
 
 /* Parse argument from request and returns the parsed command. */
 ParsedCommand parse_command(char *input) {
@@ -41,21 +42,43 @@ ParsedCommand parse_command(char *input) {
 }
 
 /* Parse a RESP simple string: +string\r\n. Returns 1 if valid, 0 otherwise. */
-int parse_simple_string(const char *input, size_t len, char output[]) {
-    if (len < 3) return 0; // +, \r, \n have not all been passed
+int parse_simple_string(const char *input, char output[]) {
     if (*input != '+') return 0;
-    if (input[len - 2] != '\r') return 0;
-    if (input[len - 1] != '\n') return 0;
-    
     int i = 0;
     input++;
-
     while (*input != '\r') {
+        if (*input == '\0') return 0; // if no \r is ever encountered, we exit with error
         output[i++] = *input++;
     }
-
+    input++;
+    if (*input != '\n') return 0;
     output[i] = '\0';
+
     return 1;
+}
+
+/* Parse a RESP bulk string: $bytes\r\nstring\r\n. Returns the bytes received as input. */
+int parse_bulk_string(const char *input, char output[]) {
+    // Check first character is $
+    if (*input != '$') return 0;
+    // Parse the number of expected characters & check it is followed by \r\n
+    int i = 0;
+    char *length_end;
+    unsigned long length = strtoul(input + 1, &length_end, 10);
+    
+    if (length_end[0] != '\r' || length_end[1] != '\n') return 0;
+    size_t bytes = (size_t)length;
+    // Parse string, copy into output & check closing \r\n are present
+    length_end = length_end + 2;
+    while (*length_end != '\r') {
+        if (*length_end == '\0') return 0; // if no \r is ever encountered, we exit with error
+        output[i++] = *length_end++;
+    }
+    length_end++;
+    if (*length_end != '\n') return 0;
+    output[i] = '\0';
+
+    return bytes;
 }
 
 int main(void) {
