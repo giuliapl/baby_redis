@@ -9,6 +9,8 @@
 #define PORT 6379
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
+#define MAX_ARGS 4
+#define MAX_ARG_SIZE 100
 
 typedef enum {
     CMD_INVALID,
@@ -21,9 +23,15 @@ typedef struct {
     char *argument;
 } ParsedCommand;
 
+typedef struct {
+    int argc;
+    char argv[MAX_ARGS][MAX_ARG_SIZE];
+} RedisCommand;
+
 ParsedCommand parse_command(char *input);
 int parse_simple_string(const char *input, char output[]);
 int parse_bulk_string(const char *input, char output[]);
+RedisCommand *parse_redis_command(const char *input);
 
 /* Parse argument from request and returns the parsed command. */
 ParsedCommand parse_command(char *input) {
@@ -81,7 +89,38 @@ int parse_bulk_string(const char *input, char output[]) {
     return bytes;
 }
 
+/* Parse a RESP command: *argc\r\nbulk_str_argvs. Returns the pointer to the newly created command. */
+RedisCommand *parse_redis_command(const char *input) {
+    if (*input != '*') return 0;
+    // Parse the number of expected argv & check it is followed by \r\n
+    char *argc_end_ptr;
+    unsigned int argc = strtoul(input + 1, &argc_end_ptr, 10);
+    if (argc_end_ptr[0] != '\r' || argc_end_ptr[1] != '\n') return 0;
+    char *command_ptr = argc_end_ptr;
+    // Move past the array header
+    command_ptr += 2;
+    // Populate structure
+    RedisCommand *redis_command = malloc(sizeof(RedisCommand));
+    redis_command->argc = argc;
+    int bulk_parsed_bytes = 0;
+    for (int i = 0; i < argc; i++) {
+        if (*command_ptr == '\0') return 0;
+        // find a '$'
+        if (*command_ptr == '$') {
+            // call parse_bulk_string() & store the result in argv[i]
+            bulk_parsed_bytes = parse_bulk_string(command_ptr, redis_command->argv[i]);
+        }
+        // move ptr forward by the number of characters + \r\n twice + the $byte itself
+        command_ptr = command_ptr + bulk_parsed_bytes + 6;
+    }
+
+    return redis_command;
+}
+
 int main(void) {
+    // char *test = "*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nAlice\r\n";
+    // RedisCommand *res = parse_redis_command(test);
+
     // File descriptors
     int server_fd;
     int client_fd;
