@@ -12,41 +12,27 @@
 #define MAX_ARGS 4
 #define MAX_ARG_SIZE 100
 
-typedef enum {
-    CMD_INVALID,
-    CMD_PING,
-    CMD_ECHO
-} Command;
-
-typedef struct {
-    Command type;
-    char *argument;
-} ParsedCommand;
-
 typedef struct {
     int argc;
     char argv[MAX_ARGS][MAX_ARG_SIZE];
 } RedisCommand;
 
-ParsedCommand parse_command(char *input);
 int parse_simple_string(const char *input, char output[]);
 int parse_bulk_string(const char *input, char output[]);
 RedisCommand *parse_redis_command(const char *input);
+void handle_command(int client_fd, RedisCommand *command);
+void print_string_bytes(const char *s);
 
-/* Parse argument from request and returns the parsed command. */
-ParsedCommand parse_command(char *input) {
-    ParsedCommand result = {CMD_INVALID, NULL};
-    if (input == NULL) return result;
-    char *space = strchr(input, ' ');
-
-    if (strncmp(input, "PING", 4) == 0) {
-        result.type = CMD_PING;
-    } else if (strncmp(input, "ECHO", 4) == 0 && input[4] == ' ') {
-        result.type = CMD_ECHO;
-        result.argument = space + 1;
+/* Used for debugging: prints string bytes. */
+void print_string_bytes(const char *s) {
+    for (int i = 0; s[i] != '\0'; i++) {
+        unsigned char c = s[i];
+        if (c == '\n') printf("\\n");
+        else if (c == '\r') printf("\\r");
+        else if (c == '\t') printf("\\t");
+        else printf("%c", c);
     }
-
-    return result;
+    printf("\\0\n");
 }
 
 /* Parse a RESP simple string: +string\r\n. Returns 1 if valid, 0 otherwise. */
@@ -65,28 +51,30 @@ int parse_simple_string(const char *input, char output[]) {
     return 1;
 }
 
-/* Parse a RESP bulk string: $bytes\r\nstring\r\n. Returns the bytes received as input. */
+/* Parse a RESP bulk string: $bytes\r\nstring\r\n. Returns the number of bytes effectively consumed. */
 int parse_bulk_string(const char *input, char output[]) {
     // Check first character is $
     if (*input != '$') return 0;
     // Parse the number of expected characters & check it is followed by \r\n
-    int i = 0;
     char *length_end;
     unsigned long length = strtoul(input + 1, &length_end, 10);
     
     if (length_end[0] != '\r' || length_end[1] != '\n') return 0;
     size_t bytes = (size_t)length;
+    // Start of the actual bulk string
+    const char *string_start = length_end + 2;
     // Parse string, copy into output & check closing \r\n are present
-    length_end = length_end + 2;
-    while (*length_end != '\r') {
-        if (*length_end == '\0') return 0; // if no \r is ever encountered, we exit with error
-        output[i++] = *length_end++;
+    for (size_t i = 0; i < bytes; i++) {
+        if (string_start[i] == '\0') return 0; // return error if no \r is ever encountered
+        output[i] = string_start[i];
     }
-    length_end++;
-    if (*length_end != '\n') return 0;
-    output[i] = '\0';
+    output[bytes] = '\0';
+    // Closing \r\n must come immediately after the payload
+    const char *end = string_start + bytes;
+    if (end[0] != '\r' || end[1] != '\n') return 0;
 
-    return bytes;
+    // Return total number of input characters consumed
+    return (int)((end + 2) - input);
 }
 
 /* Parse a RESP command: *argc\r\nbulk_str_argvs. Returns the pointer to the newly created command. */
@@ -111,10 +99,38 @@ RedisCommand *parse_redis_command(const char *input) {
             bulk_parsed_bytes = parse_bulk_string(command_ptr, redis_command->argv[i]);
         }
         // move ptr forward by the number of characters + \r\n twice + the $byte itself
-        command_ptr = command_ptr + bulk_parsed_bytes + 6;
+        command_ptr += bulk_parsed_bytes;
+    }
+    printf("output: %s", redis_command->argv[0]);
+    return redis_command;
+}
+
+/* Receive an already parsed command. Sends to the server the relevant RESP bulk string. */
+void handle_command(int client_fd, RedisCommand *command) {
+    if (command->argc == 0) return; 
+    ssize_t bytes_sent = 0;
+    const char *response = "";
+    
+    // Parse first argv
+    if (strcmp(command->argv[0], "PING") == 0) { // No optional argv allowed yet 
+        response = "+PONG\r\n";
+        bytes_sent = send(client_fd, response, strlen(response), 0);
+    } else if (strcmp(command->argv[0], "ECHO") == 0) {
+        // Send bulk string. Redis accepts just 1 argv for the ECHO command
+        char header[64];
+        int header_len = snprintf(header, sizeof(header), "$%zu\r\n", strlen(command->argv[1])); // builds a RESP bulk string from values
+        response = command->argv[1];
+        bytes_sent += send(client_fd, header, header_len, 0);
+        bytes_sent += send(client_fd, response, strlen(response), 0);
+        bytes_sent += send(client_fd, "\r\n", 2, 0);
+    } else {
+        response = "-ERR unknown command\r\n";
+        bytes_sent = send(client_fd, response, strlen(response), 0);
     }
 
-    return redis_command;
+    if (bytes_sent == -1) {
+        perror("send");
+    }
 }
 
 int main(void) {
@@ -180,7 +196,7 @@ int main(void) {
         printf("Client connected\n");
 
         // recv, reads bytes sent by the client
-        char buffer[BUFFER_SIZE];
+        char buffer[BUFFER_SIZE] = {0};
 
         int bytes_received = recv(
             client_fd,
@@ -202,38 +218,13 @@ int main(void) {
         }
 
         buffer[bytes_received] = '\0';
-
+        
         printf("Received %d bytes:\n", bytes_received);
-        printf("%s\n", buffer);
-        
-        
+        print_string_bytes(buffer);
+
         // send
-        const char *response = "";
-        ParsedCommand cmd = parse_command(buffer);
-        int bytes_sent = 0;
-
-        switch (cmd.type) {
-            case CMD_PING:
-                response = "+PONG\r\n";
-                bytes_sent = send(client_fd, response, strlen(response), 0);
-                break;
-
-            case CMD_ECHO:
-                if (cmd.argument != NULL) {
-                    bytes_sent = send(client_fd, cmd.argument, strlen(cmd.argument), 0);
-                    bytes_sent = send(client_fd, "\r\n", 2, 0);
-                }
-                break;
-
-            default:
-                response = "-ERR unknown command\r\n";
-                bytes_sent = send(client_fd, response, strlen(response), 0);
-                break;
-        }
-
-        if (bytes_sent == -1) {
-            perror("send");
-        }
+        RedisCommand *cmd = parse_redis_command(buffer);
+        handle_command(client_fd, cmd);
 
         // close the CLIENT socket
         close(client_fd);
