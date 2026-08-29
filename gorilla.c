@@ -22,6 +22,9 @@ int parse_bulk_string(const char *input, char output[]);
 RedisCommand *parse_redis_command(const char *input);
 void handle_command(int client_fd, RedisCommand *command);
 void print_string_bytes(const char *s);
+char *serialize_bulk_string(const char *str, size_t size);
+char *serialize_simple_string(const char *str, size_t size);
+char *serialize_error(const char *str, size_t size);
 
 /* Used for debugging: prints string bytes. */
 void print_string_bytes(const char *s) {
@@ -64,6 +67,7 @@ int parse_bulk_string(const char *input, char output[]) {
     // Start of the actual bulk string
     const char *string_start = length_end + 2;
     // Parse string, copy into output & check closing \r\n are present
+    if (bytes >= MAX_ARG_SIZE) return 0; // prevent buffer overflow
     for (size_t i = 0; i < bytes; i++) {
         if (string_start[i] == '\0') return 0; // return error if no \r is ever encountered
         output[i] = string_start[i];
@@ -84,53 +88,113 @@ RedisCommand *parse_redis_command(const char *input) {
     char *argc_end_ptr;
     unsigned int argc = strtoul(input + 1, &argc_end_ptr, 10);
     if (argc_end_ptr[0] != '\r' || argc_end_ptr[1] != '\n') return 0;
+    if (argc > MAX_ARGS) return 0;
     char *command_ptr = argc_end_ptr;
     // Move past the array header
     command_ptr += 2;
     // Populate structure
     RedisCommand *redis_command = malloc(sizeof(RedisCommand));
+    if (redis_command == NULL) return NULL;
     redis_command->argc = argc;
     int bulk_parsed_bytes = 0;
     for (int i = 0; i < argc; i++) {
-        if (*command_ptr == '\0') return 0;
+        if (*command_ptr == '\0') {
+            free(redis_command);
+            return NULL;
+        }
         // find a '$'
-        if (*command_ptr == '$') {
-            // call parse_bulk_string() & store the result in argv[i]
-            bulk_parsed_bytes = parse_bulk_string(command_ptr, redis_command->argv[i]);
+        if (*command_ptr != '$') {
+            free(redis_command);
+            return NULL;
+        }
+        // call parse_bulk_string() & store the result in argv[i]
+        bulk_parsed_bytes = parse_bulk_string(command_ptr, redis_command->argv[i]);
+        if (bulk_parsed_bytes == 0) {
+            free(redis_command);
+            return NULL;
         }
         // move ptr forward by the number of characters + \r\n twice + the $byte itself
         command_ptr += bulk_parsed_bytes;
     }
-    printf("output: %s", redis_command->argv[0]);
+
     return redis_command;
+}
+
+/* Serialize string into a RESP bulk string from values. Returns a pointer to a character buffer. */
+char *serialize_bulk_string(const char *str, size_t size) {
+    // Calculate memory needed for header
+    int header_len = snprintf(NULL, 0, "$%zu\r\n", size);
+    // Allocate memory for the entire RESP string (final \r\n and \0 included)
+    char *result = malloc(header_len + size + 2 + 1);
+    if (result == NULL) return NULL;
+    // Actually write the header
+    snprintf(result, header_len + 1, "$%zu\r\n", size);
+    // Copy the actual data
+    memcpy(result + header_len, str, size);
+    // Add final \r\n\0
+    memcpy(result + header_len + size, "\r\n", 2);
+    result[header_len + size + 2] = '\0';
+
+    // Return the pointer to the dynamically allocated memory for the command
+    return result;
+}
+
+/* Serialize string into a RESP simple string from values. Returns a pointer to a character buffer. */
+char *serialize_simple_string(const char *str, size_t size) {
+    // '+' + data + "\r\n" + '\0'
+    char *result = malloc(1 + size + 2 + 1);
+    if (result == NULL) return NULL;
+
+    result[0] = '+';
+    memcpy(result + 1, str, size);
+    memcpy(result + 1 + size, "\r\n", 2);
+    result[1 + size + 2] = '\0';
+
+    return result;
+}
+
+/* Serialize string into a RESP error. Returns a pointer to a character buffer. */
+char *serialize_error(const char *str, size_t size) {
+    // '-' + error message + "\r\n\" + '0'
+    char *result = malloc(1 + size + 2 + 1);
+    if (result == NULL) return NULL;
+
+    result[0] = '-';
+    memcpy(result + 1, str, size);
+    memcpy(result + 1 + size, "\r\n", 2);
+    result[1 + size + 2] = '\0';
+
+    return result;
 }
 
 /* Receive an already parsed command. Sends to the server the relevant RESP bulk string. */
 void handle_command(int client_fd, RedisCommand *command) {
     if (command->argc == 0) return; 
-    ssize_t bytes_sent = 0;
-    const char *response = "";
+    char *response = NULL;
     
     // Parse first argv
-    if (strcmp(command->argv[0], "PING") == 0) { // No optional argv allowed yet 
-        response = "+PONG\r\n";
-        bytes_sent = send(client_fd, response, strlen(response), 0);
-    } else if (strcmp(command->argv[0], "ECHO") == 0) {
-        // Send bulk string. Redis accepts just 1 argv for the ECHO command
-        char header[64];
-        int header_len = snprintf(header, sizeof(header), "$%zu\r\n", strlen(command->argv[1])); // builds a RESP bulk string from values
-        response = command->argv[1];
-        bytes_sent += send(client_fd, header, header_len, 0);
-        bytes_sent += send(client_fd, response, strlen(response), 0);
-        bytes_sent += send(client_fd, "\r\n", 2, 0);
+    if (strcmp(command->argv[0], "PING") == 0 && command->argc == 1) { // No optional argv allowed yet 
+        response = serialize_simple_string("PONG", 4);
+    } else if (strcmp(command->argv[0], "ECHO") == 0 && command->argc == 2) { // Redis accepts just 1 argv for the ECHO command
+        // Send bulk string
+        response = serialize_bulk_string(command->argv[1], strlen(command->argv[1]));
     } else {
-        response = "-ERR unknown command\r\n";
-        bytes_sent = send(client_fd, response, strlen(response), 0);
+        const char *error_msg = "ERR unknown command or wrong arguments";
+        response = serialize_error(error_msg, strlen(error_msg));
     }
+
+    if (response == NULL) {
+        perror("malloc");
+        return;
+    }
+
+    ssize_t bytes_sent = send(client_fd, response, strlen(response), 0);
 
     if (bytes_sent == -1) {
         perror("send");
     }
+
+    free(response);
 }
 
 int main(void) {
@@ -198,7 +262,7 @@ int main(void) {
         // recv, reads bytes sent by the client
         char buffer[BUFFER_SIZE] = {0};
 
-        int bytes_received = recv(
+        ssize_t bytes_received = recv(
             client_fd,
             buffer,
             sizeof(buffer) - 1,
@@ -224,7 +288,10 @@ int main(void) {
 
         // send
         RedisCommand *cmd = parse_redis_command(buffer);
-        handle_command(client_fd, cmd);
+        if (cmd != NULL) {
+            handle_command(client_fd, cmd);
+            free(cmd);
+        }
 
         // close the CLIENT socket
         close(client_fd);
