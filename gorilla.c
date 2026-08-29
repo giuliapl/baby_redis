@@ -11,20 +11,36 @@
 #define BUFFER_SIZE 1024
 #define MAX_ARGS 4
 #define MAX_ARG_SIZE 100
+#define MAX_ENTRIES 100
 
 typedef struct {
     int argc;
     char argv[MAX_ARGS][MAX_ARG_SIZE];
 } RedisCommand;
 
-int parse_simple_string(const char *input, char output[]);
+typedef struct {
+    char *key;
+    char *value;
+} DatabaseEntry;
+
+typedef struct {
+    DatabaseEntry *entries[MAX_ENTRIES];
+    int size;
+} Database;
+
+
+int parse_simple_string(const char *input, char output[]); // Unused but keep it for now
 int parse_bulk_string(const char *input, char output[]);
 RedisCommand *parse_redis_command(const char *input);
 void handle_command(int client_fd, RedisCommand *command);
-void print_string_bytes(const char *s);
+void print_string_bytes(const char *s); // Just for debugging
 char *serialize_bulk_string(const char *str, size_t size);
 char *serialize_simple_string(const char *str, size_t size);
 char *serialize_error(const char *str, size_t size);
+void db_init(Database *db);
+int db_find(const Database *db, const char *key);
+void db_set(Database *db, char *key, char *value);
+char *db_get(Database *db, char *key);
 
 /* Used for debugging: prints string bytes. */
 void print_string_bytes(const char *s) {
@@ -195,6 +211,43 @@ void handle_command(int client_fd, RedisCommand *command) {
     }
 
     free(response);
+}
+
+/* Initialize the database by setting its size to 0 and all entries to NULL. Does not allocate memory. */
+void db_init(Database *db) {
+    db->size = 0;
+    for (int i = 0; i < MAX_ENTRIES; i++) {
+        db->entries[i] = NULL;
+    }
+}
+
+/* Search through db->entries for a given key. Returns the key's index if found, -1 otherwise. */
+int db_find(const Database *db, const char *key) {
+    for (int i = 0; i < db->size; i++) {
+        if (strcmp(db->entries[i]->key, key) == 0) return i;
+    }
+    return -1;
+}
+
+/* Add (or update) the provided key-value pair in the database. */
+void db_set(Database *db, char *key, char *value) {
+    int index = db_find(db, key);
+    // Key not found, add it
+    if (index == -1) {
+        db->entries[db->size] = malloc(sizeof(DatabaseEntry));
+        db->entries[db->size]->key = key;
+        db->entries[db->size]->value = value;
+        db->size++;
+    } else { // Key was already present, update value only
+        db->entries[index]->value = value;
+    }
+}
+
+/* Search the database for a given key. Returns pointer to the value if key is found. */
+char *db_get(Database *db, char *key) {
+    int index = db_find(db, key);
+    if (index == -1) return NULL;
+    return db->entries[index]->value;
 }
 
 int main(void) {
