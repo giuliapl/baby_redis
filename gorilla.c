@@ -190,7 +190,7 @@ void handle_command(Database *db, Command *command, char response[]) {
         serialize_simple_string("OK", 2, response);
     } else if (strcmp(command->argv[0], "GET") == 0 && command->argc == 2) {
         char *value = db_get(db, command->argv[1]);
-        error_msg = "ERR failed to get key from db";
+        error_msg = "1";
         if (value == NULL) {
             serialize_error(error_msg, strlen(error_msg), response);
             return;
