@@ -16,7 +16,7 @@
 typedef struct {
     int argc;
     char argv[MAX_ARGS][MAX_ARG_SIZE];
-} RedisCommand;
+} Command;
 
 typedef struct {
     char *key;
@@ -29,17 +29,17 @@ typedef struct {
 } Database;
 
 
-int parse_simple_string(const char *input, char output[]); // Unused but keep it for now
+int parse_simple_string(const char *input, char output[]);
 int parse_bulk_string(const char *input, char output[]);
-RedisCommand *parse_redis_command(const char *input);
-void handle_command(int client_fd, RedisCommand *command);
+Command *parse_command(const char *input);
+void handle_command(Database *db, Command *command, char response[]);
 void print_string_bytes(const char *s); // Just for debugging
-char *serialize_bulk_string(const char *str, size_t size);
-char *serialize_simple_string(const char *str, size_t size);
-char *serialize_error(const char *str, size_t size);
+void serialize_bulk_string(const char *str, size_t str_len, char output[]);
+void serialize_simple_string(const char *str, size_t str_len, char output[]);
+void serialize_error(const char *str, size_t str_len, char output[]);
 void db_init(Database *db);
-int db_find(const Database *db, const char *key);
-void db_set(Database *db, char *key, char *value);
+int db_find(const Database *db, const char *key); // Helper method
+int db_set(Database *db, char *key, char *value);
 char *db_get(Database *db, char *key);
 
 /* Used for debugging: prints string bytes. */
@@ -98,7 +98,7 @@ int parse_bulk_string(const char *input, char output[]) {
 }
 
 /* Parse a RESP command: *argc\r\nbulk_str_argvs. Returns the pointer to the newly created command. */
-RedisCommand *parse_redis_command(const char *input) {
+Command *parse_command(const char *input) {
     if (*input != '*') return 0;
     // Parse the number of expected argv & check it is followed by \r\n
     char *argc_end_ptr;
@@ -109,108 +109,97 @@ RedisCommand *parse_redis_command(const char *input) {
     // Move past the array header
     command_ptr += 2;
     // Populate structure
-    RedisCommand *redis_command = malloc(sizeof(RedisCommand));
-    if (redis_command == NULL) return NULL;
-    redis_command->argc = argc;
+    Command *command = malloc(sizeof *command);
+    if (command == NULL) return NULL;
+    command->argc = argc;
     int bulk_parsed_bytes = 0;
     for (int i = 0; i < argc; i++) {
         if (*command_ptr == '\0') {
-            free(redis_command);
+            free(command);
             return NULL;
         }
         // find a '$'
         if (*command_ptr != '$') {
-            free(redis_command);
+            free(command);
             return NULL;
         }
         // call parse_bulk_string() & store the result in argv[i]
-        bulk_parsed_bytes = parse_bulk_string(command_ptr, redis_command->argv[i]);
+        bulk_parsed_bytes = parse_bulk_string(command_ptr, command->argv[i]);
         if (bulk_parsed_bytes == 0) {
-            free(redis_command);
+            free(command);
             return NULL;
         }
         // move ptr forward by the number of characters + \r\n twice + the $byte itself
         command_ptr += bulk_parsed_bytes;
     }
 
-    return redis_command;
+    return command;
 }
 
-/* Serialize string into a RESP bulk string from values. Returns a pointer to a character buffer. */
-char *serialize_bulk_string(const char *str, size_t size) {
+/* Serialize string into a RESP bulk string from values. Writes into provided output. */
+void serialize_bulk_string(const char *str, size_t str_len, char output[]) {
     // Calculate memory needed for header
-    int header_len = snprintf(NULL, 0, "$%zu\r\n", size);
-    // Allocate memory for the entire RESP string (final \r\n and \0 included)
-    char *result = malloc(header_len + size + 2 + 1);
-    if (result == NULL) return NULL;
+    int header_len = snprintf(NULL, 0, "$%zu\r\n", str_len);
     // Actually write the header
-    snprintf(result, header_len + 1, "$%zu\r\n", size);
+    snprintf(output, header_len + 1, "$%zu\r\n", str_len);
     // Copy the actual data
-    memcpy(result + header_len, str, size);
+    memcpy(output + header_len, str, str_len);
     // Add final \r\n\0
-    memcpy(result + header_len + size, "\r\n", 2);
-    result[header_len + size + 2] = '\0';
-
-    // Return the pointer to the dynamically allocated memory for the command
-    return result;
+    memcpy(output + header_len + str_len, "\r\n", 2);
+    output[header_len + str_len + 2] = '\0';
 }
 
-/* Serialize string into a RESP simple string from values. Returns a pointer to a character buffer. */
-char *serialize_simple_string(const char *str, size_t size) {
+/* Serialize string into a RESP simple string from values. Writes into provided output. */
+void serialize_simple_string(const char *str, size_t str_len, char output[]) {
     // '+' + data + "\r\n" + '\0'
-    char *result = malloc(1 + size + 2 + 1);
-    if (result == NULL) return NULL;
-
-    result[0] = '+';
-    memcpy(result + 1, str, size);
-    memcpy(result + 1 + size, "\r\n", 2);
-    result[1 + size + 2] = '\0';
-
-    return result;
+    output[0] = '+';
+    memcpy(output + 1, str, str_len);
+    memcpy(output + 1 + str_len, "\r\n", 2);
+    output[1 + str_len + 2] = '\0';
 }
 
-/* Serialize string into a RESP error. Returns a pointer to a character buffer. */
-char *serialize_error(const char *str, size_t size) {
+/* Serialize string into a RESP error. Writes into provided output. */
+void serialize_error(const char *str, size_t str_len, char output[]) {
     // '-' + error message + "\r\n\" + '0'
-    char *result = malloc(1 + size + 2 + 1);
-    if (result == NULL) return NULL;
-
-    result[0] = '-';
-    memcpy(result + 1, str, size);
-    memcpy(result + 1 + size, "\r\n", 2);
-    result[1 + size + 2] = '\0';
-
-    return result;
+    output[0] = '-';
+    memcpy(output + 1, str, str_len);
+    memcpy(output + 1 + str_len, "\r\n", 2);
+    output[1 + str_len + 2] = '\0';
 }
 
-/* Receive an already parsed command. Sends to the server the relevant RESP bulk string. */
-void handle_command(int client_fd, RedisCommand *command) {
-    if (command->argc == 0) return; 
-    char *response = NULL;
-    
-    // Parse first argv
-    if (strcmp(command->argv[0], "PING") == 0 && command->argc == 1) { // No optional argv allowed yet 
-        response = serialize_simple_string("PONG", 4);
-    } else if (strcmp(command->argv[0], "ECHO") == 0 && command->argc == 2) { // Redis accepts just 1 argv for the ECHO command
-        // Send bulk string
-        response = serialize_bulk_string(command->argv[1], strlen(command->argv[1]));
-    } else {
-        const char *error_msg = "ERR unknown command or wrong arguments";
-        response = serialize_error(error_msg, strlen(error_msg));
-    }
-
-    if (response == NULL) {
-        perror("malloc");
+/* Receive an initialized database, an already parsed command and an output buffer.
+Writes into the provided output the relevant RESP response output. */
+void handle_command(Database *db, Command *command, char response[]) {
+    char *error_msg = "ERR no arguments provided";
+    if (command->argc == 0) {
+        serialize_error(error_msg, strlen(error_msg), response);
         return;
     }
-
-    ssize_t bytes_sent = send(client_fd, response, strlen(response), 0);
-
-    if (bytes_sent == -1) {
-        perror("send");
+    // Execute command
+    if (strcmp(command->argv[0], "PING") == 0 && command->argc == 1) { // No optional argv allowed yet 
+        serialize_simple_string("PONG", 4, response);
+    } else if (strcmp(command->argv[0], "ECHO") == 0 && command->argc == 2) { // Redis accepts just 1 argv for the ECHO command
+        serialize_bulk_string(command->argv[1], strlen(command->argv[1]), response);
+    } else if (strcmp(command->argv[0], "SET") == 0 && command->argc == 3) {
+        int is_set = db_set(db, command->argv[1], command->argv[2]);
+        error_msg = "ERR failed to set key into db";
+        if (!is_set) {
+            serialize_error(error_msg, strlen(error_msg), response);
+            return;
+        }
+        serialize_simple_string("OK", 2, response);
+    } else if (strcmp(command->argv[0], "GET") == 0 && command->argc == 2) {
+        char *value = db_get(db, command->argv[1]);
+        error_msg = "ERR failed to get key from db";
+        if (value == NULL) {
+            serialize_error(error_msg, strlen(error_msg), response);
+            return;
+        }
+        serialize_bulk_string(value, strlen(value), response);
+    } else {
+        error_msg = "ERR unknown command or wrong arguments";
+        serialize_error(error_msg, strlen(error_msg), response);
     }
-
-    free(response);
 }
 
 /* Initialize the database by setting its size to 0 and all entries to NULL. Does not allocate memory. */
@@ -229,18 +218,37 @@ int db_find(const Database *db, const char *key) {
     return -1;
 }
 
-/* Add (or update) the provided key-value pair in the database. */
-void db_set(Database *db, char *key, char *value) {
+/* Add (or update) the provided key-value pair in the database. Returns 1 if valid, 0 otherwise. */
+int db_set(Database *db, char *key, char *value) {
     int index = db_find(db, key);
-    // Key not found, add it
-    if (index == -1) {
-        db->entries[db->size] = malloc(sizeof(DatabaseEntry));
-        db->entries[db->size]->key = key;
-        db->entries[db->size]->value = value;
+
+    if (index == -1) { // Key not found, add it
+        DatabaseEntry *entry = malloc(sizeof *entry);
+        if (entry == NULL) return 0;
+
+        entry->key = malloc(strlen(key) + 1);
+        if (entry->key == NULL) {
+            free(entry);
+            return 0;
+        }
+
+        entry->value = malloc(strlen(value) + 1);
+        if (entry->value == NULL) {
+            free(entry->key);
+            free(entry);
+            return 0;
+        }
+
+        strcpy(entry->key, key); // could have used strdup()
+        strcpy(entry->value, value);
+
+        db->entries[db->size] = entry;
         db->size++;
     } else { // Key was already present, update value only
         db->entries[index]->value = value;
     }
+
+    return 1;
 }
 
 /* Search the database for a given key. Returns pointer to the value if key is found. */
@@ -251,9 +259,6 @@ char *db_get(Database *db, char *key) {
 }
 
 int main(void) {
-    // char *test = "*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nAlice\r\n";
-    // RedisCommand *res = parse_redis_command(test);
-
     // File descriptors
     int server_fd;
     int client_fd;
@@ -298,6 +303,9 @@ int main(void) {
 
     printf("Redis server listening on 127.0.0.1:%d\n", PORT);
 
+    Database *db = malloc(sizeof *db);
+    if (db == NULL) return -1;
+    db_init(db);
 
     // Main server loop
     while (1) {
@@ -313,12 +321,13 @@ int main(void) {
         printf("Client connected\n");
 
         // recv, reads bytes sent by the client
-        char buffer[BUFFER_SIZE] = {0};
+        char input_buffer[BUFFER_SIZE] = {0};
+        char output_buffer[BUFFER_SIZE] = {0};
 
         ssize_t bytes_received = recv(
             client_fd,
-            buffer,
-            sizeof(buffer) - 1,
+            input_buffer,
+            sizeof(input_buffer) - 1,
             0
         );
 
@@ -334,16 +343,23 @@ int main(void) {
             continue;
         }
 
-        buffer[bytes_received] = '\0';
+        input_buffer[bytes_received] = '\0';
         
         printf("Received %d bytes:\n", bytes_received);
-        print_string_bytes(buffer);
+        print_string_bytes(input_buffer);
 
         // send
-        RedisCommand *cmd = parse_redis_command(buffer);
-        if (cmd != NULL) {
-            handle_command(client_fd, cmd);
-            free(cmd);
+        Command *command = parse_command(input_buffer);
+
+        if (command != NULL) {
+            handle_command(db, command, output_buffer);
+            free(command);
+        }
+
+        ssize_t bytes_sent = send(client_fd, output_buffer, strlen(output_buffer), 0);
+
+        if (bytes_sent == -1) {
+            perror("send");
         }
 
         // close the CLIENT socket
