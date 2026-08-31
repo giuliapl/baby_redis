@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -28,10 +29,15 @@ typedef struct {
     int size;
 } Database;
 
+typedef enum {
+    PARSE_INVALID,
+    PARSE_INCOMPLETE,
+    PARSE_COMPLETE
+} ParseStatus;
 
 int parse_simple_string(const char *input, char output[]);
-int parse_bulk_string(const char *input, char output[]);
-Command *parse_command(const char *input);
+ParseStatus parse_bulk_string(const char *input, size_t input_len, char output[], size_t *consumed);
+ParseStatus parse_command(const char *input, size_t input_len, Command **result, size_t *consumed);
 void handle_command(Database *db, Command *command, char response[]);
 void print_string_bytes(const char *s); // Just for debugging
 void serialize_bulk_string(const char *str, size_t str_len, char output[]);
@@ -41,6 +47,7 @@ void db_init(Database *db);
 int db_find(const Database *db, const char *key); // Helper method
 int db_set(Database *db, char *key, char *value);
 char *db_get(Database *db, char *key);
+int send_all(int fd, const char *buffer, size_t length);
 
 /* Used for debugging: prints string bytes. */
 void print_string_bytes(const char *s) {
@@ -71,69 +78,103 @@ int parse_simple_string(const char *input, char output[]) {
 }
 
 /* Parse a RESP bulk string: $bytes\r\nstring\r\n. Returns the number of bytes effectively consumed. */
-int parse_bulk_string(const char *input, char output[]) {
+ParseStatus parse_bulk_string(const char *input, size_t input_len, char output[], size_t *consumed) {
     // Check first character is $
-    if (*input != '$') return 0;
-    // Parse the number of expected characters & check it is followed by \r\n
-    char *length_end;
-    unsigned long length = strtoul(input + 1, &length_end, 10);
-    
-    if (length_end[0] != '\r' || length_end[1] != '\n') return 0;
-    size_t bytes = (size_t)length;
-    // Start of the actual bulk string
-    const char *string_start = length_end + 2;
-    // Parse string, copy into output & check closing \r\n are present
-    if (bytes >= MAX_ARG_SIZE) return 0; // prevent buffer overflow
-    for (size_t i = 0; i < bytes; i++) {
-        if (string_start[i] == '\0') return 0; // return error if no \r is ever encountered
-        output[i] = string_start[i];
+    if (input_len == 0) return PARSE_INCOMPLETE;
+    if (input[0] != '$') return PARSE_INVALID;
+
+    size_t position = 1;
+    size_t bytes = 0;
+    if (position == input_len) return PARSE_INCOMPLETE;
+    if (input[position] < '0' || input[position] > '9') return PARSE_INVALID;
+
+    while (position < input_len && input[position] >= '0' && input[position] <= '9') {
+        size_t digit = (size_t)(input[position] - '0');
+        if (bytes > (MAX_ARG_SIZE - 1 - digit) / 10) return PARSE_INVALID;
+        bytes = bytes * 10 + digit;
+        position++;
     }
+
+    if (position == input_len) return PARSE_INCOMPLETE;
+    if (input[position] != '\r') return PARSE_INVALID;
+    if (position + 1 >= input_len) return PARSE_INCOMPLETE;
+    if (input[position + 1] != '\n') return PARSE_INVALID;
+    position += 2;
+
+    // Start of the actual bulk string
+    const char *string_start = input + position;
+    // Parse string, copy into output & check closing \r\n are present
+    if (bytes >= MAX_ARG_SIZE) return PARSE_INVALID;
+    if (input_len - position < bytes + 2) return PARSE_INCOMPLETE;
+    memcpy(output, string_start, bytes);
     output[bytes] = '\0';
     // Closing \r\n must come immediately after the payload
     const char *end = string_start + bytes;
-    if (end[0] != '\r' || end[1] != '\n') return 0;
+    if (end[0] != '\r' || end[1] != '\n') return PARSE_INVALID;
 
     // Return total number of input characters consumed
-    return (int)((end + 2) - input);
+    *consumed = position + bytes + 2;
+    return PARSE_COMPLETE;
 }
 
-/* Parse a RESP command: *argc\r\nbulk_str_argvs. Returns the pointer to the newly created command. */
-Command *parse_command(const char *input) {
-    if (*input != '*') return 0;
-    // Parse the number of expected argv & check it is followed by \r\n
-    char *argc_end_ptr;
-    unsigned int argc = strtoul(input + 1, &argc_end_ptr, 10);
-    if (argc_end_ptr[0] != '\r' || argc_end_ptr[1] != '\n') return 0;
-    if (argc > MAX_ARGS) return 0;
-    char *command_ptr = argc_end_ptr;
-    // Move past the array header
-    command_ptr += 2;
-    // Populate structure
-    Command *command = malloc(sizeof *command);
-    if (command == NULL) return NULL;
-    command->argc = argc;
-    int bulk_parsed_bytes = 0;
-    for (int i = 0; i < argc; i++) {
-        if (*command_ptr == '\0') {
-            free(command);
-            return NULL;
-        }
-        // find a '$'
-        if (*command_ptr != '$') {
-            free(command);
-            return NULL;
-        }
-        // call parse_bulk_string() & store the result in argv[i]
-        bulk_parsed_bytes = parse_bulk_string(command_ptr, command->argv[i]);
-        if (bulk_parsed_bytes == 0) {
-            free(command);
-            return NULL;
-        }
-        // move ptr forward by the number of characters + \r\n twice + the $byte itself
-        command_ptr += bulk_parsed_bytes;
+/* Parse one RESP command and report how many input bytes belong to it. */
+ParseStatus parse_command(const char *input, size_t input_len, Command **result, size_t *consumed) {
+    *result = NULL;
+    *consumed = 0;
+    if (input_len == 0) return PARSE_INCOMPLETE;
+    if (input[0] != '*') return PARSE_INVALID;
+
+    size_t position = 1;
+    unsigned int argc = 0;
+    if (position == input_len) return PARSE_INCOMPLETE;
+    if (input[position] < '0' || input[position] > '9') return PARSE_INVALID;
+
+    while (position < input_len && input[position] >= '0' && input[position] <= '9') {
+        argc = argc * 10 + (unsigned int)(input[position] - '0');
+        if (argc > MAX_ARGS) return PARSE_INVALID;
+        position++;
     }
 
-    return command;
+    if (position == input_len) return PARSE_INCOMPLETE;
+    if (input[position] != '\r') return PARSE_INVALID;
+    if (position + 1 >= input_len) return PARSE_INCOMPLETE;
+    if (input[position + 1] != '\n') return PARSE_INVALID;
+    position += 2;
+
+    // Populate structure
+    Command *command = malloc(sizeof *command);
+    if (command == NULL) return PARSE_INVALID;
+    command->argc = argc;
+    for (unsigned int i = 0; i < argc; i++) {
+        size_t argument_bytes = 0;
+        ParseStatus status = parse_bulk_string(
+            input + position,
+            input_len - position,
+            command->argv[i],
+            &argument_bytes
+        );
+        if (status != PARSE_COMPLETE) {
+            free(command);
+            return status;
+        }
+        position += argument_bytes;
+    }
+
+    *result = command;
+    *consumed = position;
+    return PARSE_COMPLETE;
+}
+
+/* send() may write only part of a response, so keep going until all bytes are sent. */
+int send_all(int fd, const char *buffer, size_t length) {
+    size_t sent = 0;
+    while (sent < length) {
+        ssize_t result = send(fd, buffer + sent, length - sent, 0);
+        if (result == -1 && errno == EINTR) continue;
+        if (result <= 0) return 0;
+        sent += (size_t)result;
+    }
+    return 1;
 }
 
 /* Serialize string into a RESP bulk string from values. Writes into provided output. */
@@ -330,46 +371,70 @@ int main(void) {
 
         printf("Client connected\n");
 
-        // recv, reads bytes sent by the client
+        // TCP is a byte stream: accumulate bytes until complete commands exist.
         char input_buffer[BUFFER_SIZE] = {0};
         char output_buffer[BUFFER_SIZE] = {0};
+        size_t buffered = 0;
+        int close_client = 0;
 
-        ssize_t bytes_received = recv(
-            client_fd,
-            input_buffer,
-            sizeof(input_buffer) - 1,
-            0
-        );
+        while (!close_client) {
+            ssize_t bytes_received = recv(
+                client_fd,
+                input_buffer + buffered,
+                sizeof(input_buffer) - buffered,
+                0
+            );
 
-        if (bytes_received == -1) {
-            perror("recv");
-            close(client_fd);
-            continue;
-        }
+            if (bytes_received == -1 && errno == EINTR) continue;
+            if (bytes_received == -1) {
+                perror("recv");
+                break;
+            }
+            if (bytes_received == 0) {
+                printf("Client disconnected\n");
+                break;
+            }
 
-        if (bytes_received == 0) {
-            printf("Client disconnected\n");
-            close(client_fd);
-            continue;
-        }
+            buffered += (size_t)bytes_received;
+            size_t processed = 0;
 
-        input_buffer[bytes_received] = '\0';
-        
-        printf("Received %d bytes:\n", bytes_received);
-        print_string_bytes(input_buffer);
+            while (processed < buffered) {
+                Command *command = NULL;
+                size_t consumed = 0;
+                ParseStatus status = parse_command(
+                    input_buffer + processed,
+                    buffered - processed,
+                    &command,
+                    &consumed
+                );
 
-        // send
-        Command *command = parse_command(input_buffer);
+                if (status == PARSE_INCOMPLETE) break;
+                if (status == PARSE_INVALID) {
+                    const char *error = "-ERR invalid RESP command\r\n";
+                    send_all(client_fd, error, strlen(error));
+                    close_client = 1;
+                    break;
+                }
 
-        if (command != NULL) {
-            handle_command(db, command, output_buffer);
-            free(command);
-        }
+                handle_command(db, command, output_buffer);
+                free(command);
+                if (!send_all(client_fd, output_buffer, strlen(output_buffer))) {
+                    close_client = 1;
+                    break;
+                }
+                processed += consumed;
+            }
 
-        ssize_t bytes_sent = send(client_fd, output_buffer, strlen(output_buffer), 0);
+            if (processed > 0) {
+                memmove(input_buffer, input_buffer + processed, buffered - processed);
+                buffered -= processed;
+            }
 
-        if (bytes_sent == -1) {
-            perror("send");
+            if (buffered == sizeof(input_buffer)) {
+                const char *error = "-ERR command too large\r\n";
+                send_all(client_fd, error, strlen(error));
+                close_client = 1;
+            }
         }
 
         // close the CLIENT socket
