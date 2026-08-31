@@ -245,7 +245,17 @@ int db_set(Database *db, char *key, char *value) {
         db->entries[db->size] = entry;
         db->size++;
     } else { // Key was already present, update value only
-        db->entries[index]->value = value;
+        size_t required = strlen(value) + 1;
+        char *new_value = realloc(db->entries[index]->value, required);
+        if (new_value == NULL) return 0;  // db->entries[index]->value remains valid
+        db->entries[index]->value = new_value;
+        memcpy(db->entries[index]->value, value, required);
+        // Allocate-copy-free alternative:
+        // char *new_value = malloc(strlen(value) + 1);
+        // if (new_value == NULL) return 0;
+        // strcpy(new_value, value);          // Database-owned copy
+        // free(db->entries[index]->value);   // Release old allocation
+        // db->entries[index]->value = new_value;
     }
 
     return 1;
