@@ -264,6 +264,7 @@ int db_set(Database *db, char *key, char *value) {
     int index = db_find(db, key);
 
     if (index == -1) { // Key not found, add it
+        if (db->size >= MAX_ENTRIES) return 0;
         DatabaseEntry *entry = malloc(sizeof *entry);
         if (entry == NULL) return 0;
 
